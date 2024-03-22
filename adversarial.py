@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import time
 import os
+os.environ['CUDA_LAUNCH_BLOCKING']="1"
 import random
 import sys
 import traceback
@@ -13,16 +14,23 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.autograd import Variable
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset, TensorDataset
+from utils.tokenizers import Tokenizer
+# from utils.dataloaders_mimic import R2DataLoader
+# from utils.dataloaders_mimic import R2DataLoader
+# from utils.datasets_mimic import *
 
 from utils.models import *
 from utils.discriminator import *
 from utils.discriminators import *
 
 from tqdm import tqdm
+from utils.tokenizers import Tokenizer
 
 from utils.disc_dataset import *
-from utils.dataset import get_loader as get_loader_t
+from utils.dataset_cov import get_loader as get_loader_t
 from adver_trainer import LSTMDebugger
+from metric_performance import compute_scores
 
 
 class AdversarialBase:
@@ -33,7 +41,8 @@ class AdversarialBase:
 
         self.params = None
         self.train_loss = 0
-        self.batch_size = 4
+        self.batch_size = self.args.batch_size
+        self.max_bleu1 = -0.001
         self.g_min_train_loss = 100000000000
         self.d_min_train_loss = 100000000000
         self.d_min_train_loss_1 = 100000000000
@@ -42,9 +51,9 @@ class AdversarialBase:
         self.vocab, self.vocab_count = self._init_vocab()
 
         self.extractor = self._init_visual_extractor()
-        self.mlc = self._init_mlc()
-        self.co_attention = self._init_co_attention()
-
+        # self.mlc = self._init_mlc()
+        # self.co_attention = self._init_co_attention()
+        self.semantic = self._init_semantic_embedding()
         self.sentence_model = self._init_sentence_model()
         self.word_model = self._init_word_model()
         self.model_state_dict = self._load_model_state_dict()
@@ -54,7 +63,7 @@ class AdversarialBase:
         self.ce_criterion = self._init_ce_criterion()
         self.mse_criterion = self._init_mse_criterion()
 
-        self.reward = torch.zeros(self.batch_size, 1)
+        self.reward = torch.zeros(self.args.batch_size, 1)
         self.optimizer = self._init_optimizer()
         self.optimizer_d = self._init_optimizer_d()
         self.optimizer_d_1 = self._init_optimizer_d_1()
@@ -63,9 +72,36 @@ class AdversarialBase:
         self.model_dir = self._init_model_dir()
 
         self.gen_model = torch.load(self.args.load_model_path)
-        self.train_transform = self._init_train_transform()
-        self.data_loader = self._init_data_loader(self.args.adver_file_list, self.train_transform)
-        self.logger = self._init_logger()
+        # self.logger = self._init_logger()
+        # self.tokenizer = Tokenizer(args)
+        self.file_list = self.args.file_list
+        self.split = 'test'
+        self.s_max = self.args.s_max
+        self.n_max = self.args.n_max
+        self.transform = transforms.Compose([
+            transforms.Resize(300),
+            transforms.RandomCrop(256),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406),
+                                 (0.229, 0.224, 0.225))])
+        # self.data_loader = self._init_data_loader(self.args.adver_file_list, self.transform)
+        self.data_loader = self._init_data_loader(split='train', transform=self.transform, shuffle=True)
+        # self.data_loader = R2DataLoader(args, s_max=self.s_max,  n_max=self.n_max, vocabulary=self.vocab,
+        #                                       file_list=self.file_list,  tokenizer=self.tokenizer,  split=self.split,
+        #                                       transform=self.transform)
+        self.test_data_loader = self._init_data_loader(split='test', transform=self.transform, shuffle=False)
+
+    def _init_data_loader(self, split, transform, shuffle):
+        data_loader = get_loader_t(data_dir=self.args.data_dir,
+                                 split=split,
+                                 vocabulary=self.vocab,
+                                 transform=transform,
+                                 batch_size=self.args.batch_size,
+                                 s_max=self.args.s_max,
+                                 n_max=self.args.n_max,
+                                 shuffle=shuffle)
+        return data_loader
 
     def _init_vocab(self):
         with open(self.args.vocab_path, 'rb') as f:
@@ -91,19 +127,10 @@ class AdversarialBase:
                                  vocabulary=self.vocab,
                                  batch_size=self.batch_size,
                                  s_max=6,
-                                 n_max=40,
+                                 n_max=30,
                                  shuffle=True)
         return data_loader
 
-    def _init_train_transform(self):
-        transform = transforms.Compose([
-            transforms.Resize(self.args.resize),
-            transforms.RandomCrop(self.args.crop_size),
-            # transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406),
-                                 (0.229, 0.224, 0.225))])
-        return transform
 
     def _load_model_state_dict(self):
         self.start_epoch = 0
@@ -118,13 +145,12 @@ class AdversarialBase:
             return None
 
     def _init_visual_extractor(self):
-        model = VisualFeatureExtractor(model_name=self.args.visual_model_name,
-                                       pretrained=self.args.pretrained)
+        model = VisualFeatureExtractor(self.args.embed_size)
 
         try:
             model_state = torch.load(self.args.load_visual_model_path)
             model.load_state_dict(model_state['extractor'])
-            # print("[Load Visual Extractor Succeed!]\n")
+            print("[Load Visual Extractor Succeed!]\n")
         except Exception as err:
             print("[Load Visual Extractor Model Failed] {}\n".format(err))
 
@@ -140,6 +166,26 @@ class AdversarialBase:
         if self.args.cuda:
             model = model.cuda()
 
+        return model
+
+    def _init_semantic_embedding(self):
+        model = SemanticEmbedding(embed_size=self.args.embed_size)
+        try:
+            model_state = torch.load(self.args.load_semantic_model_path)
+            model.load_state_dict(model_state['semantic'])
+            print("[Load Semantic Embedding Succeed!]\n")
+        except Exception as err:
+            print("[Load Semantic Embedding Failed {}!]\n".format(err))
+        if not self.args.semantic_trained:
+            for i, param in enumerate(model.parameters()):
+                param.requires_grad = False
+        else:
+            if self.params:
+                self.params += list(model.parameters())
+            else:
+                self.params = list(model.parameters())
+        if self.args.cuda:
+            model = model.cuda()
         return model
 
     def _init_mlc(self):
@@ -202,9 +248,9 @@ class AdversarialBase:
     def _init_word_model(self):
         raise NotImplementedError
 
-    def _init_logger(self):
-        logger = open('./results/results.txt', 'w')
-        return logger
+    # def _init_logger(self):
+    #     logger = open('./results/results.txt', 'w')
+    #     return logger
 
     def __save_json(self, result):
         result_path = self.args.result_path
@@ -213,21 +259,18 @@ class AdversarialBase:
         with open(os.path.join(result_path, '{}.json'.format(self.args.result_name)), 'w') as f:
             json.dump(result, f)  # 将json信息写进文件  dump
 
-    def _init_data_loader(self, file_list, transform):
-        data_loader = get_loader_t(image_dir=self.args.image_dir,
-                                   caption_json=self.args.caption_json,
-                                   file_list=file_list,
-                                   vocabulary=self.vocab,
-                                   transform=transform,
-                                   batch_size=self.batch_size,
-                                   s_max=self.args.s_max,
-                                   n_max=self.args.n_max,
-                                   shuffle=True)
-        return data_loader
+    def __save_json_test(self, result):
+        result_path = self.args.result_path_test
+        if not os.path.exists(result_path):
+            os.makedirs(result_path)
+        with open(os.path.join(result_path, '{}.json'.format(self.args.result_name)), 'w') as f:
+            json.dump(result, f)  # 将json信息写进文件  dump
 
-    def __vec2sent(self, array):  # array是word_id 将Word_id转成单词
+
+
+    def __vec2sent(self, words_id):  # array是word_id 将Word_id转成单词
         sampled_caption = []
-        for word_id in array:
+        for word_id in words_id:
             word = self.vocab.get_word_by_id(word_id)
             if word == '<start>':
                 continue
@@ -238,46 +281,56 @@ class AdversarialBase:
 
     def generate(self):
         self.extractor.train()
-        self.mlc.train()
-        self.co_attention.train()
+        self.semantic.train()
         self.sentence_model.train()
         self.word_model.train()
         progress_bar = tqdm(self.data_loader, desc='Generating')
         results = {}
-        writer = open('./data/new_data/disc_train_fake_data.txt', 'w')
-        for images, image_id, label, captions, _ in progress_bar:
-            images = self._to_var(images, requires_grad=False)
-            visual_features, avg_features = self.extractor.forward(images)
-            tags, semantic_features = self.mlc.forward(avg_features)
-            sentence_states = None
-            prev_hidden_states = self._to_var(torch.zeros(images.shape[0], 1, self.args.hidden_size))
+        with open("./data/new_data/all_true_data_cov.json", 'r') as fj:
+            data = json.load(fj)
+        write1 = open('./data/new_data/disc_train_fake_data.txt', 'w')
+        fj = open('./data/new_data/disc_train_true_data.txt', 'w')
+        for images1, images2, captions, prob, image_id in progress_bar:
+            images_frontal = self._to_var(images1, requires_grad=False)
+            images_lateral = self._to_var(images2, requires_grad=False)
+            frontal, lateral, avg = self.extractor.forward(images_frontal, images_lateral)
+            state_c, state_h = self.semantic.forward(avg)
+            state = (torch.unsqueeze(state_c, 0), torch.unsqueeze(state_h, 0))
+            pre_hid = torch.unsqueeze(state_h, 1)
+            # tags, semantic_features = self.mlc.forward(avg_features)
+            # sentence_states = None
+            # prev_hidden_states = self._to_var(torch.zeros(images.shape[0], 1, self.args.hidden_size))
             pred_sentences = {}  # 预测
             real_sentences = {}  # 真实
             for i in image_id:
                 pred_sentences[i] = {}  # 具体到每一张
                 real_sentences[i] = {}
             for i in range(self.args.s_max):  # 句子数
-                ctx, alpha_v, alpha_a = self.co_attention.forward(avg_features, semantic_features, prev_hidden_states)
-                topic, p_stop, hidden_state, sentence_states = self.sentence_model.forward(ctx,
-                                                                                           prev_hidden_states,
-                                                                                           sentence_states)
-                start_tokens = np.zeros((topic.shape[0], 1))  # [4, 1]
-                start_tokens[:, 0] = self.vocab('<start>')
+                # ctx, alpha_v, alpha_a = self.co_attention.forward(avg_features, semantic_features, prev_hidden_states)
+                topic,  p_stop, state, h0_word, c0_word, pre_hid = self.sentence_model.forward(frontal, lateral, state, pre_hid)
+                p_stop = p_stop.squeeze(1)
+                p_stop = torch.unsqueeze(torch.max(p_stop, 1)[1], 1)
+                start_tokens = np.zeros(images_frontal.shape[0])
+                state_word =(c0_word, h0_word)
+                start_tokens[:] = self.vocab('<start>')
                 start_tokens = self._to_var(torch.Tensor(start_tokens).long(), requires_grad=False)
-                sample_ids = self.word_model.sample(topic, start_tokens)
-                prev_hidden_states = hidden_state
-                for id, array in zip(image_id, sample_ids):
-                    pred_sentences[id][i] = self.__vec2sent(array)  # cpu().detach().numpy()
+                sample_ids,_ = self.word_model.sample(start_tokens, state_word)
+                sample_ids = sample_ids * p_stop.cpu().numpy()
+                # prev_hidden_states = hidden_state
+                for id, words_id in zip(image_id, sample_ids):
+                    pred_sentences[id][i] = self.__vec2sent(words_id)  # cpu().detach().numpy()
             for id, array in zip(image_id, captions):
                 for i, sent in enumerate(array):
                     real_sentences[id][i] = self.__vec2sent(sent)
-            for id, pred_tag, real_tag in zip(image_id, tags, label):
+            for id in image_id:
                 results[id] = {
                     'Pred Sent': pred_sentences[id],
                     'Real Sent': real_sentences[id]
                 }
-                writer.write(str(pred_sentences[id]) + "." + "\n")
-        writer.close()
+                write1.write(str(pred_sentences[id]) + "." + "\n")
+                fj.write(data[str(id)]+"\n")
+        fj.close()
+        write1.close()
         #  操作 disc_fake
         with open('./data/new_data/disc_train_fake_data.txt', 'r') as fr:
             lines = fr.readlines()
@@ -291,6 +344,103 @@ class AdversarialBase:
         f.writelines(lines)
         f.close()
         self.__save_json(results)
+
+    def test(self):
+        self.extractor.train()
+        # self.mlc.train()
+        # self.co_attention.train()
+        self.semantic.train()
+        self.sentence_model.train()
+        self.word_model.train()
+
+        progress_bar = tqdm(self.test_data_loader, desc='Generating')
+        results = {}
+        for images1, images2, captions, prob, image_id in progress_bar:
+            images_frontal = self._to_var(images1, requires_grad=False)
+            images_lateral = self._to_var(images2, requires_grad=False)
+            # visual_features, avg_features = self.extractor.forward(images)
+            # tags, semantic_features = self.mlc.forward(avg_features)
+            # print(str(images_frontal.shape) + " " + str(images_lateral.shape))
+            frontal, lateral, avg = self.extractor.forward(images_frontal, images_lateral)
+            state_c, state_h = self.semantic.forward(avg)
+            state = (torch.unsqueeze(state_c, 0), torch.unsqueeze(state_h, 0))
+            pre_hid = torch.unsqueeze(state_h, 1)
+
+            # sentence_states = None
+            # prev_hidden_states = self.__to_var(torch.zeros(images.shape[0], 1, self.args.hidden_size))
+            pred_sentences = {}  # 预测
+            real_sentences = {}  # 真实
+            for i in image_id:
+                pred_sentences[i] = {}  # 具体到每一张
+                real_sentences[i] = {}
+
+            for i in range(self.args.s_max):   # 句子数
+                # ctx, alpha_v, alpha_a = self.co_attention.forward(avg_features, semantic_features, prev_hidden_states)
+                # topic, p_stop, hidden_state, sentence_states = self.sentence_model.forward(ctx,
+                #                                                                            prev_hidden_states,
+                #                                                                            sentence_states)
+                _, p_stop, state, h0_word, c0_word, pre_hid = self.sentence_model.forward(frontal, lateral, state,
+                                                                                          pre_hid)
+                p_stop = p_stop.squeeze(1)
+                p_stop = torch.unsqueeze(torch.max(p_stop, 1)[1], 1)
+                start_tokens = np.zeros(images_frontal.shape[0])  # [4, 1]
+                # start_tokens[:, 0] = self.vocab('<start>')
+                # start_tokens = self.__to_var(torch.Tensor(start_tokens).long(), requires_grad=False)
+                #
+                # sample_ids = self.word_model.sample(topic, start_tokens)
+                state_word = (c0_word, h0_word)
+                start_tokens[:] = self.vocab('<start>')
+                start_tokens = self._to_var(torch.Tensor(start_tokens).long(), requires_grad=False)
+                sample_ids,_ = self.word_model.sample(start_tokens, state_word)  # [4,50]
+                sample_ids = sample_ids * p_stop.cpu().numpy()
+                # p_stop = p_stop.squeeze(1)
+                # p_stop = torch.max(p_stop, 1)[1].unsqueeze(1)
+                # sample_ids = torch.Tensor(sample_ids).cpu() * p_stop.cpu()
+
+                # prev_hidden_states = hidden_state
+                # print(type(sample_ids))
+                for id, array in zip(image_id, sample_ids):
+                    pred_sentences[id][i] = self.__vec2sent(array)  # cpu().detach().numpy()
+                # sys.exit()
+            # for i in image_id:
+            #     with open("./data/new_data/all_true_data.json", 'r') as fj:
+            #         data = json.load(fj)
+            #     fj = open('./data/new_data/disc_train_true_data.txt', 'a')
+            #     fj.writelines(data[i]+"\n")
+            for id, array in zip(image_id, captions):
+                for i, sent in enumerate(array):
+                    real_sentences[id][i] = self.__vec2sent(sent)
+            for id in image_id:
+                results[id] = {
+                    # 'Real Tags': self.tagger.inv_tags2array(real_tag),
+                    # 'Pred Tags': self.tagger.array2tags(torch.topk(pred_tag, self.args.k)[1].cpu().data.numpy()),
+                    'Pred Sent': pred_sentences[id],
+                    'Real Sent': real_sentences[id]
+                }
+                # print(id)
+                # print("pred_sentences", pred_sentences[id])
+                # print("=====================================================")
+
+        self.__save_json_test(results)
+        gts = []
+        res = []
+        for key in results:
+            gt = ""
+            re = ""
+            for i in results[key]["Real Sent"]:
+                if results[key]["Real Sent"][i] != "":
+                    gt = gt + results[key]["Real Sent"][i] + " . "
+
+            for i in results[key]["Pred Sent"]:
+                if results[key]["Pred Sent"][i] != "":
+                    re = re + results[key]["Pred Sent"][i] + " . "
+            gts.append(gt)
+            res.append(re)
+
+        test_met = compute_scores({i: [gt] for i, gt in enumerate(gts)},
+                                  {i: [re] for i, re in enumerate(res)})
+        print(test_met)
+        return test_met
 
     @staticmethod
     def _init_mse_criterion():
@@ -360,7 +510,7 @@ class AdversarialBase:
     def _init_discs_model(self):  # 加载判别器
         model = Discriminators(vocab_size=self.vocab_count,
                               input_size=50,
-                              hidden_size=100,
+                              hidden_size=512,
                               num_class=2,
                               num_layers=1)
         try:
@@ -383,23 +533,30 @@ class AdversarialBase:
         return model
     def _save_model_g(self,
                     epoch_id,
-                    g_loss):
+                    g_loss, b1, b2, b3, b4, ROUGE_L, CIDEr, METEOR):
         def save_whole_model(_filename):
             print("Saved Model in {}\n".format(_filename))
             torch.save({'extractor': self.extractor.state_dict(),
-                        'mlc': self.mlc.state_dict(),
-                        'co_attention': self.co_attention.state_dict(),
+                        'semantic': self.semantic.state_dict(),
                         'sentence_model': self.sentence_model.state_dict(),
                         'word_model': self.word_model.state_dict(),
                         'optimizer': self.optimizer.state_dict(),
                         'epoch': epoch_id},
                        os.path.join(self.args.saved_model_name, "{}".format(_filename)))
-        # file_name = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())) + "train_best_loss.pth.tar"
-        # save_whole_model(file_name)
         if g_loss < self.g_min_train_loss:
-            file_name = "train_best_loss_lstm_best.pth.tar"
+            file_name = "ad_train_best_loss.pth.tar"
             save_whole_model(file_name)
             self.g_min_train_loss = g_loss
+        if b1 > self.max_bleu1:
+            file_name = "test_best.pth.tar"
+            save_whole_model(file_name)
+            self.max_bleu1 = b1
+            self.max_bleu2 = b2
+            self.max_bleu3 = b3
+            self.max_bleu4 = b4
+            self.max_METEOR = METEOR
+            self.max_ROUGE_L = ROUGE_L
+            self.max_CIDEr = CIDEr
 
     def _save_model(self,
                     epoch_id,
@@ -411,10 +568,8 @@ class AdversarialBase:
                         'epoch': epoch_id},
                        os.path.join(self.args.disc_saved_model_name, "{}".format(_filename)))
 
-        # file_name = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())) + "disc_train_best_loss.pth.tar"
-        # save_whole_model(file_name)
         if loss < self.d_min_train_loss:
-            file_name = "disc_train_best_loss_lstm_best.pth.tar"
+            file_name = "ad_disc_train_best_loss.pth.tar"
             save_whole_model(file_name)
             self.d_min_train_loss = loss
 
@@ -429,7 +584,7 @@ class AdversarialBase:
                        os.path.join(self.args.discs_saved_model_name, "{}".format(_filename)))
 
         if loss < self.d_min_train_loss_1:
-            file_name = "discs_train_best_loss_lstm_best.pth.tar"
+            file_name = "ad_discs_train_best_loss.pth.tar"
             save_whole_model(file_name)
             self.d_min_train_loss_1 = loss
     def _to_var(self, x, requires_grad=True):
@@ -444,14 +599,15 @@ class AdversarialBase:
         return str(time.strftime('%Y%m%d-%H:%M', time.gmtime()))
 
     def loss_with_reward(self, prediction, x, rewards):
-        embedding = nn.Embedding(2195, 2195)
+        embedding = nn.Embedding(213, 213)
         prediction = embedding(prediction.long())
         x1 = x.contiguous().view([-1, 1]).long()
-        one_hot = torch.Tensor(x1.shape[0], 2195).cuda()
+        one_hot = torch.Tensor(x1.shape[0], 213).cuda()
         one_hot.zero_()
         x2 = one_hot.scatter_(1, x1, 1)
-        pred1 = prediction.view([-1, 2195])
+        pred1 = prediction.view([-1, 213])
         pred2 = torch.log(torch.clamp(pred1, min=1e-20, max=1.0))
+        # print(str(prediction.shape) + " " + str(x2.shape) + " " + str(pred2.shape))
         prod = torch.mul(x2.cuda(), pred2.cuda())
         reduced_prod = torch.sum(prod, dim=1)
         rewards_prod = torch.mul(reduced_prod.cuda(), rewards.view([-1]).cuda())
@@ -459,59 +615,71 @@ class AdversarialBase:
         return -generator_loss
 
     def loss_with_reward_1(self, prediction, x, rewards):
-        embedding = nn.Embedding(2195, 2195)
+        embedding = nn.Embedding(213, 213)
         prediction = embedding(prediction.long())
         # print ("prediction after embedding:", prediction.shape)
         x1 = x.contiguous().view([-1, 1]).long()
         # print ("x1:", x1.shape)
 
-        one_hot = torch.Tensor(x1.shape[0], 2195).cuda()
+        one_hot = torch.Tensor(x1.shape[0], 213).cuda()
         one_hot.zero_()
         x2 = one_hot.scatter_(1, x1, 1)
 
-        pred1 = prediction.view([-1, 2195])
+        pred1 = prediction.view([-1, 213])
         pred2 = torch.log(torch.clamp(pred1, min=1e-20, max=1.0))
         prod = torch.mul(x2.cuda(), pred2.cuda())
         reduced_prod = torch.sum(prod, dim=1)
         rewards_prod = torch.mul(reduced_prod.cuda(), rewards.view([-1]).cuda())
         generator_loss = torch.sum(rewards_prod)
         return -generator_loss
+
     def adver(self):
         print ("update generator")
         tag_loss, stop_loss, word_loss, loss = 0, 0, 0, 0
-        for i, (images, image_id, label, captions, prob) in enumerate(self.data_loader):
-
+        for i, (images1, images2, captions, prob, image_id) in enumerate(self.data_loader):
+            # print(i)
             batch_tag_loss, batch_stop_loss, batch_word_loss, batch_sentence_loss, batch_sentence_loss_1,batch_loss = 0, 0, 0, 0, 0, 0
-            images = self._to_var(images, requires_grad=False)
-            visual_features, avg_features = self.extractor.forward(images)
-            tags, semantic_features = self.mlc.forward(avg_features)
-            # 标签损失
-            batch_tag_loss = self.mse_criterion(tags, self._to_var(label, requires_grad=False)).sum()
-            sentence_states = None
+            images_frontal = self._to_var(images1, requires_grad=False)
+            images_lateral = self._to_var(images2, requires_grad=False)
+            frontal, lateral, avg = self.extractor.forward(images_frontal, images_lateral)
+            state_c, state_h = self.semantic.forward(avg)
+            state = (torch.unsqueeze(state_c, 0), torch.unsqueeze(state_h, 0))
+            pre_hid = torch.unsqueeze(state_h, 1)
+
             # 中间层
-            prev_hidden_states = self._to_var(torch.zeros(images.shape[0], 1, self.args.hidden_size), requires_grad=False)
-            context = self._to_var(torch.Tensor(captions).long(), requires_grad=False)
+            # prev_hidden_states = self._to_var(torch.zeros(images.shape[0], 1, self.args.hidden_size), requires_grad=False)
+            prob_real = self._to_var(torch.Tensor(prob).long(), requires_grad=False)
+            captions = self._to_var(torch.Tensor(captions).long(), requires_grad=False)
             pred_sentences = []  # 预测
             reward_1 = []
             for sentence_index in range(0, captions.shape[1]):  # 是s_max=6 一个caption里有六句话
-                ctx, alpha_v, alpha_a = self.co_attention.forward(avg_features,
-                                                                  semantic_features,
-                                                                  prev_hidden_states)
-                topic, p_stop, hidden_states, sentence_states = self.sentence_model.forward(ctx,
-                                                                                            prev_hidden_states,
-                                                                                            sentence_states)
+
+                # ctx, alpha_v, alpha_a = self.co_attention.forward(avg_features,
+                #                                                   semantic_features,
+                #                                                   prev_hidden_states)
+                # topic, p_stop, hidden_states, sentence_states = self.sentence_model.forward(ctx,
+                #                                                                             prev_hidden_states,
+                #                                                                             sentence_states)
                 # batch_stop_loss += self.ce_criterion(p_stop.squeeze(), prob_real[:, sentence_index]).sum().item()
                 # for word_index in range(0, captions.shape[2]):  # 0
                 #     words = self.word_model.forward(topic, context[:, sentence_index, :word_index])
                 #     word_mask = (context[:, sentence_index, word_index] > 0).float()
                     # batch_word_loss += (self.ce_criterion(words, context[:, sentence_index, word_index])
                     #                     * word_mask).sum() * (0.9 ** word_index)
-                start_tokens = np.zeros((topic.shape[0], 1))  # [4, 1]
-                start_tokens[:, 0] = self.vocab('<start>')
+                topic, p_stop, state, h0_word, c0_word, pre_hid = self.sentence_model.forward(frontal, lateral, state, pre_hid)
+                p_stop = p_stop.squeeze(1)
+                p_stop = torch.unsqueeze(torch.max(p_stop, 1)[1], 1)
+                start_tokens = np.zeros(images_frontal.shape[0])
+
+                state_word = (c0_word, h0_word)
+                start_tokens[:] = self.vocab('<start>')
                 start_tokens = self._to_var(torch.Tensor(start_tokens).long(), requires_grad=False)
-                sample_ids = self.word_model.sample(topic, start_tokens)  # [4,50]
+                sample_ids, _ = self.word_model.sample(start_tokens, state_word)  # [4,50]
+                sample_ids = sample_ids * p_stop.cpu().numpy()
                 reward = []
+                # print(type(sample_ids))
                 sample_ids = torch.from_numpy(sample_ids)
+                # print(type(sample_ids))
                 pred_sentences.append(sample_ids)
                 for j in range(0, sample_ids.shape[1]):
                     output = self.disc_model.forward(sample_ids[:, j:j + 1].cuda().long())
@@ -524,14 +692,18 @@ class AdversarialBase:
                 reward = torch.Tensor(reward)
                 s = []
                 a = [0]
-                for i in range(0, context[:, sentence_index, :].shape[0]):
-                    t = context[:, sentence_index, :][i].tolist()  # 将tensor转为list
-                    for j in range(0, self.args.n_max - context[:, sentence_index, :] .shape[1] ):
+                # print(captions.shape)
+                for i in range(0, captions[:, sentence_index, :].shape[0]):
+                    t = captions[:, sentence_index, :][i].tolist()  # 将tensor转为list
+                    for j in range(0, self.args.n_max-captions[:, sentence_index, :].shape[1]):
                         t.extend(a)
                     s.append(t)
                 context1 = torch.Tensor(s)
+                # print(str(captions[:, sentence_index, :].shape) +" " + str(context1.shape))
+                # sys.exit()
                 # 每个词相加得到reward “语义奖励”
                 batch_sentence_loss += (self.loss_with_reward(sample_ids, context1.cuda(), reward)).sum().item()
+                # print("---------------")
             # 整个句子得到一个reward， “结构奖励”
             t = torch.LongTensor()
             for i in pred_sentences:
@@ -588,25 +760,28 @@ class Adversarial(AdversarialBase):
         #             for i in out:
         #                 reward.append(i.item())
         #         reward = np.transpose(np.array(reward)) / 1.0
-        for _ in range(5):
+        for _ in range(1):
             g_loss = self.adver() # g_step
+
         # Test
-        for _ in range(1):  # t
+        for _ in range(2):  # t
             print("Use New Generator To Generate Fake Data")
             self.generate()
             print("Train the discriminator")
             # 1A Train D on real
-            for _ in range(10): # d_step
+            for _ in range(3): # d_step
                 d_loss_t, d_loss_f = 0.0, 0.0
+                d_loss_t_1, d_loss_f_1 = 0.0, 0.0
                 train_data_loader_t = self._init_data_loader_true()
+                print("---------")
                 for i, inputs in enumerate(train_data_loader_t):
                     batch_loss_t,batch_loss_t_1 = 0.0, 0.0
                     labels = torch.LongTensor(np.ones([self.batch_size, 1], dtype=np.int64))
                     labels = self._to_var(labels, requires_grad=False)
                     inputs = self._to_var(torch.Tensor(inputs).float(), requires_grad=False)
                     inputs = inputs.view(self.batch_size, -1)
-                    outputs = self.discs_model.forward(inputs.long())
-                    batch_loss_t_1 = self.ce_criterion(outputs.squeeze(), labels.squeeze().cpu()).sum()
+                    # outputs = self.discs_model.forward(inputs.long())
+                    # batch_loss_t_1 = self.ce_criterion(outputs.squeeze(), labels.squeeze().cpu()).sum()
 
                     for j in range(1, inputs.shape[1]):
                         output = self.disc_model.forward(inputs[:, j:j + 1].long())
@@ -615,28 +790,28 @@ class Adversarial(AdversarialBase):
                         output = torch.index_select(output, 1, indices.cuda())
                         batch_loss_t += self.bce_criterion(output, labels.float()).sum()
                     self.optimizer_d.zero_grad()
-                    self.optimizer_d_1.zero_grad()
+                    # self.optimizer_d_1.zero_grad()
 
                     batch_loss_t = self._to_var(batch_loss_t, requires_grad=True)
                     batch_loss_t.backward()
-                    batch_loss_t_1 = self._to_var(batch_loss_t_1, requires_grad=True)
-                    batch_loss_t_1.backward()
+                    # batch_loss_t_1 = self._to_var(batch_loss_t_1, requires_grad=True)
+                    # batch_loss_t_1.backward()
                     d_loss_t = batch_loss_t.item()
-                    d_loss_t_1 = batch_loss_t_1.item()
+                    # d_loss_t_1 = batch_loss_t_1.item()
 
                 # train on fake data
+                print("********")
                 train_data_loader_f = self._init_data_loader_fake()
                 for i, inputs in enumerate(train_data_loader_f):
                     batch_loss_f = 0.0
-                    labels = torch.LongTensor(np.zeros([self.batch_size, 1], dtype=np.int64))
+                    labels = torch.LongTensor(np.zeros([self.args.batch_size, 1], dtype=np.int64))
                     labels = self._to_var(labels, requires_grad=False)
                     inputs = self._to_var(torch.Tensor(inputs).float(), requires_grad=False)
-                    inputs = inputs.view(self.batch_size, -1)
-                    outputs = self.discs_model.forward(inputs.long())
-                    batch_loss_f_1 = self.ce_criterion(outputs.squeeze(), labels.squeeze().cpu()).sum()
+                    inputs = inputs.view(self.args.batch_size, -1)
+                    # outputs = self.discs_model.forward(inputs.long())
+                    # batch_loss_f_1 = self.ce_criterion(outputs.squeeze(), labels.squeeze().cpu()).sum()
                     for j in range(1, inputs.shape[1]):
                         output = self.disc_model.forward(inputs[:, j:j + 1].long())
-
                         output = self._to_var(output, requires_grad=False)
                         indices = torch.LongTensor([0])
                         output = torch.index_select(output, 1, indices.cuda())
@@ -644,67 +819,59 @@ class Adversarial(AdversarialBase):
                     # batch_loss_f = self._to_var(batch_loss_f, requires_grad=True)
                     # batch_loss_f_1 = self._to_var(batch_loss_f_1, requires_grad=True)
                     self.optimizer_d.zero_grad()
-                    self.optimizer_d_1.zero_grad()
+                    # self.optimizer_d_1.zero_grad()
                     batch_loss_f = self._to_var(torch.tensor(batch_loss_f))
-                    batch_loss_f_1 = self._to_var(torch.tensor(batch_loss_f_1))
+                    # batch_loss_f_1 = self._to_var(torch.tensor(batch_loss_f_1))
 
                     batch_loss_f.backward()
-                    batch_loss_f_1.backward()
+                    # batch_loss_f_1.backward()
                     if self.args.clip > 0:
                         torch.nn.utils.clip_grad_norm(self.disc_model.parameters(), self.args.clip)
                     self.optimizer_d.step()
-                    self.optimizer_d_1.step()
+                    # self.optimizer_d_1.step()
 
                     d_loss_f = batch_loss_f.item()
-                    d_loss_f_1 = batch_loss_f_1.item()
-        return g_loss, d_loss_t + d_loss_f, d_loss_t_1 + d_loss_f_1
+                    # d_loss_f_1 = batch_loss_f_1.item()
+                print("%%%%%%%")
+        test_met = self.test()
+        return g_loss, d_loss_t + d_loss_f, d_loss_t_1 + d_loss_f_1, test_met
 
     def train(self):
         Loss_list = []
         for epoch in range(0, self.args.epochs):
             print ("=======Epoch:", epoch, "======")
-            g_loss, d_loss, d_loss_1 = self.epoch_train()
+            g_loss, d_loss, d_loss_1, test_met = self.epoch_train()
             print(" D-train loss_t:{} -  lr:{}\n".format(d_loss,
                                                        self.optimizer_d.param_groups[0]['lr']))
             print(" D-train_1 loss_t:{} -  lr:{}\n".format(d_loss_1,
                                                          self.optimizer_d_1.param_groups[0]['lr']))
             print(" G-train loss:{} -  lr:{}\n".format(g_loss,
                                                        self.optimizer.param_groups[0]['lr']))
-
             # Loss_list.append(g_loss/1000000)
-            self.logger.write(str(g_loss/1000000) +  "\n")
-
+            # self.logger.write(str(g_loss/1000000) +  "\n")
+            b1 = test_met['BLEU_1']
+            b2 = test_met['BLEU_2']
+            b3 = test_met['BLEU_3']
+            b4 = test_met['BLEU_4']
+            METEOR = test_met['METEOR']
+            CIDEr = test_met['CIDEr']
+            ROUGE_L = test_met['ROUGE_L']
             self._save_model_g(epoch,
-                               g_loss)
+                               g_loss, b1, b2, b3, b4, ROUGE_L, CIDEr, METEOR)
             self._save_model(epoch,
                              d_loss)
             self._save_model_1(epoch,
                              d_loss_1)
         # 迭代了200次，所以x的取值范围为(0，200)，然后再将每次相对应的准确率以及损失率附在x上
-        x = range(0, 150)
-        y = Loss_list
-
-        plt.subplot(2, 1, 2)
-        plt.plot(x, y, ls="-", lw=2, label="MIRGAN loss vs. epoches")
-        plt.xlabel('Epoches')
-        plt.ylabel('MIRGAN loss')
-        plt.savefig("./results/loss.jpg")
-        plt.show()
-
-        print('#########################################################################')
 
     def _init_sentence_model(self):
-        model = SentenceLSTM(version=self.args.sent_version,
-                             embed_size=self.args.embed_size,
-                             hidden_size=self.args.hidden_size,
-                             num_layers=self.args.sentence_num_layers,
-                             dropout=self.args.dropout,
-                             momentum=self.args.momentum)
+        model = SentenceLSTM(embed_size=self.args.embed_size,
+                             hidden_size=self.args.hidden_size)
 
         try:
             model_state = torch.load(self.args.load_sentence_model_path)
             model.load_state_dict(model_state['sentence_model'])
-            # print("[Load Sentence Model From {} Succeed!\n".format(self.args.load_sentence_model_path))
+            print("[Load Sentence Model From {} Succeed!\n".format(self.args.load_sentence_model_path))
         except Exception as err:
             print("[Load Sentence model Failed {}!]\n".format(err))
 
@@ -722,16 +889,15 @@ class Adversarial(AdversarialBase):
         return model
 
     def _init_word_model(self):
-        model = WordLSTM(vocab_size=self.vocab_count,
-                         embed_size=self.args.embed_size,
+        model = WordLSTM(embed_size=self.args.embed_size,
                          hidden_size=self.args.hidden_size,
-                         num_layers=self.args.word_num_layers,
+                         vocab_size=len(self.vocab),
                          n_max=self.args.n_max)
 
         try:
             model_state = torch.load(self.args.load_word_model_path)
             model.load_state_dict(model_state['word_model'])
-            # print("[Load Word Model From {} Succeed!\n".format(self.args.load_word_model_path))
+            print("[Load Word Model From {} Succeed!\n".format(self.args.load_word_model_path))
         except Exception as err:
             print("[Load Word model Failed {}!]\n".format(err))
 
@@ -754,12 +920,15 @@ if __name__ == '__main__':
 
     warnings.filterwarnings("ignore")
     parser = argparse.ArgumentParser()
-
+    # RESUME_MODEL_PATH = '../cm/Medical_Report_Generation_with_CNN_HLSTM/models/2023-10-30 21:31/train_best.pth.tar'
     """
     Data Argument
     """
+    parser.add_argument('--data_dir', type=str, default='/home/upc/sxx/Data/cov_ctr/annotation.json',
+                        help='path for images')
     parser.add_argument('--patience', type=int, default=50)
     # parser.add_argument('--mode', type=str, default='train')
+    parser.add_argument('--batch_size', type=int, default=16)
 
     # Disc Path Argument
 
@@ -771,6 +940,7 @@ if __name__ == '__main__':
                         help='the val array')
     parser.add_argument('--file_list', type=str, default='./data/new_data/adver_list.txt',
                         help='the path for test file list')
+    parser.add_argument('--threshold', type=int, default=3, help='the cut off frequency for the words.')
 
     # transforms argument
     parser.add_argument('--resize', type=int, default=256,
@@ -780,26 +950,24 @@ if __name__ == '__main__':
 
     # Disc Load/Save model argument
 
-    parser.add_argument('--disc_model_path', type=str, default='./report_disc_models/',
-                        help='path for saving disc trained models')
     parser.add_argument('--discs_model_path', type=str, default='./report_discs_models/',
                         help='path for saving disc model')
     parser.add_argument('--disc_trained', action='store_true', default=True,
                         help='Whether train disc or not')
-    parser.add_argument('--load_disc_model_path', type=str, default='./report_disc_models/v4/disc_train_best_loss.pth.tar',
+    parser.add_argument('--load_disc_model_path', type=str, default='./report_disc_models/v4_cov/disc_train_best_loss.pth.tar',
                         help='The path of loaded disc model')
     parser.add_argument('--load_discs_model_path', type=str,
-                        default='./report_discs_models/v4/discs_train_best_loss.pth.tar',
+                        default='./report_discs_models/v4_cov/discs_train_best_loss.pth.tar',
                         help='The path of loaded discs model')
-    parser.add_argument('--disc_saved_model_name', type=str, default='./report_disc_models/v4/',
+    parser.add_argument('--disc_saved_model_name', type=str, default='./report_disc_models/v4_cov/',
                         help='The name of saved model')
-    parser.add_argument('--discs_saved_model_name', type=str, default='./report_discs_models/v4/',
+    parser.add_argument('--discs_saved_model_name', type=str, default='./report_discs_models/v4_cov/',
                         help='The name of saved model')
 
 
 
     # Path Argument
-    parser.add_argument('--vocab_path', type=str, default='./data/new_data/vocab.pkl',
+    parser.add_argument('--vocab_path', type=str, default='./data/new_data/vocab_cov.pkl',
                         help='the path for vocabulary object')
     parser.add_argument('--image_dir', type=str, default='./data/images',
                         help='the path for images')
@@ -813,9 +981,9 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default='./report_v4_models/',
                         help='path for saving trained models')
     parser.add_argument('--load_model_path', type=str,
-                        default='./report_v4_models/v4/lstm/2023-03-21 15:15:16train_best_loss_generation_best.pth.tar',
+                        default='./report_v4_models/v4_cov/train_best_loss.pth.tar',
                         help='The path of loaded model')
-    parser.add_argument('--saved_model_name', type=str, default='./report_v4_models/v4/',
+    parser.add_argument('--saved_model_name', type=str, default='./report_v4_models/v4_cov/',
                         help='The name of saved model')
 
     # VisualFeatureExtractor
@@ -823,23 +991,27 @@ if __name__ == '__main__':
                         help='CNN model name')
     parser.add_argument('--pretrained', action='store_true', default=False,
                         help='not using pretrained model when training')
+
     parser.add_argument('--load_visual_model_path', type=str,
-                        default='./report_v4_models/v4/lstm/2023-03-21 15:15:16train_best_loss_generation_best.pth.tar')
+                        default='./report_v4_models/v4_cov/train_best_loss.pth.tar')
     parser.add_argument('--visual_trained', action='store_true', default=True,
                         help='Whether train visual extractor or not')
+    parser.add_argument('--num_workers', type=int, default=0, help='the number of workers for dataloader.')
+    # parser.add_argument('--ann_path', type=str, default='./data/mimic_cxr/annotation.json', help='the path to the directory containing the data.')
+    parser.add_argument('--max_seq_length', type=int, default=60, help='the maximum sequence length of the reports.')
 
     # MLC
-    parser.add_argument('--classes', type=int, default=210)
+    parser.add_argument('--classes', type=int, default=14)
     parser.add_argument('--sementic_features_dim', type=int, default=512)
     parser.add_argument('--k', type=int, default=10)
     parser.add_argument('--load_mlc_model_path', type=str,
-                        default='./report_v4_models/v4/lstm/2023-03-21 15:15:16train_best_loss_generation_best.pth.tar')
+                        default='./report_v4_models/v4_cov/train_best_loss.pth.tar')
     parser.add_argument('--mlc_trained', action='store_true', default=True)
 
     # Co-Attention
     parser.add_argument('--attention_version', type=str, default='v4')
     parser.add_argument('--load_co_model_path', type=str,
-                        default='./report_v4_models/v4/lstm/2023-03-21 15:15:16train_best_loss_generation_best.pth.tar')
+                        default='./report_v4_models/v4_cov/train_best_loss.pth.tar')
     parser.add_argument('--co_trained', action='store_true', default=True)
     # Sentence Model
     parser.add_argument('--momentum', type=int, default=0.1)
@@ -849,41 +1021,46 @@ if __name__ == '__main__':
     parser.add_argument('--sentence_num_layers', type=int, default=2)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--load_sentence_model_path', type=str,
-                        default='./report_v4_models/v4/lstm/2023-03-21 15:15:16train_best_loss_generation_best.pth.tar')
+                        default='./report_v4_models/v4_cov/train_best_loss.pth.tar')
     parser.add_argument('--sentence_trained', action='store_true', default=True)
 
     # Word Model
     parser.add_argument('--word_num_layers', type=int, default=1)
     parser.add_argument('--load_word_model_path', type=str,
-                        default='./report_v4_models/v4/lstm/2023-03-21 15:15:16train_best_loss_generation_best.pth.tar')
+                        default='./report_v4_models/v4_cov/train_best_loss.pth.tar')
     parser.add_argument('--word_trained', action='store_true', default=True)
 
     # Saved result
-    parser.add_argument('--result_path', type=str, default='./results',
+    parser.add_argument('--result_path', type=str, default='./results_test',
                         help='the path for storing results')
-    parser.add_argument('--result_name', type=str, default='generate0',
+    parser.add_argument('--result_path_test', type=str, default='./results_test',
+                        help='the path for storing results')
+    parser.add_argument('--result_name', type=str, default='generate',
                         help='the name of results')
 
     """
     Training Argument
     """
-    parser.add_argument('--learning_rate', type=int, default=0.01)
-    parser.add_argument('--epochs', type=int, default=200)  # 1000
+    # parser.add_argument('--learning_rate_gen', type=int, default=5e-5)
+    parser.add_argument('--learning_rate', type=int, default=1e-5)
+    parser.add_argument('--epochs', type=int, default=50)  # 1000
 
     parser.add_argument('--clip', type=float, default=0.35,
                         help='gradient clip, -1 means no clip (default: 0.35)')
     parser.add_argument('--s_max', type=int, default=6)
-    parser.add_argument('--n_max', type=int, default=30)
+    parser.add_argument('--n_max', type=int, default=15)
 
     # Loss Function
     parser.add_argument('--lambda_tag', type=float, default=10000)
     parser.add_argument('--lambda_stop', type=float, default=10)
     parser.add_argument('--lambda_sentence', type=float, default=1)
     parser.add_argument('--lambda_word', type=float, default=1)
+    parser.add_argument('--load_semantic_model_path', type=str, default="./report_v4_models/v4_cov/train_best_loss.pth.tar")
+    parser.add_argument('--semantic_trained', action='store_true', default=False)
 
 
     args = parser.parse_args()
     args.cuda = torch.cuda.is_available()
-
+    # tokenizer = Tokenizer(args)
     adversarial = Adversarial(args)
     adversarial.train()

@@ -15,9 +15,9 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.autograd import Variable
 from utils.discriminators import *
 from utils.models import *
-from utils.dataset import *
+from utils.dataset_cov import *
 from utils.loss import *
-from utils.logger import Logger
+# from utils.logger import Logger
 from utils.padding import TxtDataset
 import utils.word_embedding as data_utils
 from utils.disc_dataset import *
@@ -32,7 +32,7 @@ class DiscBase:
 
         self._init_model_path()
         self.disc_model_dir = self._init_disc_model_dir()
-        self.writer = self._init_writer()
+        # self.writer = self._init_writer()
         self.vocab, self.vocab_count = self._init_vocab()
         self.model_state_dict = self._load_model_state_dict()
 
@@ -46,8 +46,8 @@ class DiscBase:
 
         self.optimizer = self._init_optimizer()
         self.scheduler = self._init_scheduler()  # 自动调整学习率
-        self.logger = self._init_logger()
-        self.writer.write("{}\n".format(self.args))
+        # self.logger = self._init_logger()
+        # self.writer.write("{}\n".format(self.args))
 
     def train(self):
         for epoch_id in range(self.start_epoch, self.args.epochs):  # 训练的轮
@@ -69,10 +69,10 @@ class DiscBase:
             self._save_model(epoch_id,
                              train_loss)
 
-            self._log(train_loss=train_loss,
-                      # val_loss=val_loss,
-                      lr=self.optimizer.param_groups[0]['lr'],
-                      epoch=epoch_id)
+            # self._log(train_loss=train_loss,
+            #           # val_loss=val_loss,
+            #           lr=self.optimizer.param_groups[0]['lr'],
+            #           epoch=epoch_id)
 
     def _epoch_train(self):
         raise NotImplementedError
@@ -97,7 +97,7 @@ class DiscBase:
     def _init_vocab(self):
         with open(self.args.vocab_path, 'rb') as f:
             vocab = pickle.load(f)
-        print("Vocabulary Size:{}\n".format(len(vocab)))
+        # print("Vocabulary Size:{}\n".format(len(vocab)))
 
         return vocab, len(vocab)
 
@@ -144,7 +144,7 @@ class DiscBase:
                                  vocabulary=self.vocab,
                                  batch_size=self.batch_size,
                                  s_max=10,
-                                 n_max=50,
+                                 n_max=30,
                                  shuffle=True)
         return data_loader
 
@@ -153,7 +153,7 @@ class DiscBase:
                                  vocabulary=self.vocab,
                                  batch_size=self.batch_size,
                                  s_max=10,
-                                 n_max=50,
+                                 n_max=30,
                                  shuffle=True)
         return data_loader
 
@@ -177,27 +177,27 @@ class DiscBase:
     def _init_optimizer(self):
         return torch.optim.Adam(params=self.params, lr=self.args.learning_rate)
 
-    def _log(self,
-             train_loss,
-             # val_loss,
-             lr,
-             epoch):
-        info = {
-            'train loss': train_loss,
-            # 'val loss': val_loss,
-            'learning rate': lr
-        }
+    # def _log(self,
+    #          train_loss,
+    #          # val_loss,
+    #          lr,
+    #          epoch):
+    #     info = {
+    #         'train loss': train_loss,
+    #         # 'val loss': val_loss,
+    #         'learning rate': lr
+    #     }
 
-        for tag, value in info.items():
-            self.logger.scalar_summary(tag, value, epoch + 1)
+    #     for tag, value in info.items():
+    #         self.logger.scalar_summary(tag, value, epoch + 1)
 
-    def _init_logger(self):
-        logger = Logger(os.path.join(self.disc_model_dir, 'logs'))
-        return logger
+    # def _init_logger(self):
+    #     logger = Logger(os.path.join(self.disc_model_dir, 'logs'))
+    #     return logger
 
-    def _init_writer(self):
-        writer = open(os.path.join(self.disc_model_dir, 'logs.txt'), 'w')
-        return writer
+    # def _init_writer(self):
+    #     writer = open(os.path.join(self.disc_model_dir, 'logs.txt'), 'w')
+    #     return writer
 
     def _to_var(self, x, requires_grad=True):
         if self.args.cuda:
@@ -213,9 +213,9 @@ class DiscBase:
         if not os.path.exists(self.args.disc_model_path):
             os.makedirs(self.args.disc_model_path)
 
-    def _init_log_path(self):
-        if not os.path.exists(self.args.log_path):
-            os.makedirs(self.args.log_path)
+    # def _init_log_path(self):
+    #     if not os.path.exists(self.args.log_path):
+    #         os.makedirs(self.args.log_path)
 
     def _save_model(self,
                     epoch_id,
@@ -257,21 +257,18 @@ class Debugger(DiscBase):
 
         self.disc_model.train()
         train_data_loader = self._init_data_loader()
-        for i,inputs in enumerate(train_data_loader):
+        for  i,inputs in enumerate(train_data_loader):
             labels = torch.LongTensor(np.ones([self.batch_size, 1], dtype=np.int64))
             labels = self._to_var(labels, requires_grad=False)
 
             inputs = torch.LongTensor(inputs)
-            # print ("sds", inputs.shape)
             final_out = self.disc_model.forward(inputs.reshape(self.batch_size, -1))
             batch_loss = self.ce_criterion(final_out.squeeze(), labels.squeeze().cpu()).sum()
-            # print ("true data batch loss", batch_loss)
-
             batch_loss.backward()  # compute/store gradients, but don't change params
 
             true_loss += batch_loss.item()
 
-        print("true loss:", true_loss)
+        # print("true loss:", true_loss)
         # print("true_acc= ", true_acc/len(train_data_loader))
         return true_loss, 0
 
@@ -284,7 +281,7 @@ class Debugger(DiscBase):
 
         self.disc_model.train()
         train_data_loader = self._init_data_loader_fake()
-        for i, fake_inputs in enumerate(train_data_loader):
+        for  i,inputs in enumerate(train_data_loader):
             # a = []
             # lengths = []
             # for input in inputs:
@@ -302,18 +299,17 @@ class Debugger(DiscBase):
             # for i in range(self.batch_size):
             #     a.append(torch.unsqueeze(torch.cat(tuple(inputs[i]), 0), 0))
             # inputs = torch.cat(a, 0)
-            fake_inputs = torch.LongTensor(fake_inputs)
+            # print (torch.LongTensor(inputs))
+            inputs = torch.LongTensor(inputs)
 
-            final_out = self.disc_model.forward(fake_inputs.reshape(self.batch_size, -1))
-            # print ("dsdada", final_out)
+            final_out = self.disc_model.forward(inputs.reshape(self.batch_size, -1))
             batch_loss = self.ce_criterion(final_out.squeeze(), labels.squeeze().cpu()).sum()
-            # print ("batch loss", batch_loss)
 
             batch_loss.backward()  # compute/store gradients, but don't change params
 
             fake_loss += batch_loss.item()
 
-        print("fake loss:", fake_loss)
+        # print("fake loss:", fake_loss)
         # print("true_acc= ", true_acc/len(train_data_loader))
         return fake_loss, 0
 
@@ -330,9 +326,9 @@ if __name__ == '__main__':
     parser.add_argument('--mode', type=str, default='train')
 
     # Path Argument
-    parser.add_argument('--vocab_path', type=str, default='./data/new_data/vocab.pkl',
+    parser.add_argument('--vocab_path', type=str, default='./data/new_data/vocab_cov.pkl',
                         help='the path for vocabulary object')
-    parser.add_argument('--disc_train_true_data_list', type=str, default='./data/new_data/captions.txt',
+    parser.add_argument('--disc_train_true_data_list', type=str, default='./data/new_data/disc_train_true_data.txt',
                         help='the path for True data')
     parser.add_argument('--disc_train_fake_data_list', type=str, default='./data/new_data/disc_train_fake_data.txt',
                         help='the path for Fake data')
@@ -347,15 +343,15 @@ if __name__ == '__main__':
                         help='Whether train or not')
     parser.add_argument('--load_disc_model_path', type=str, default='.',
                         help='The path of loaded disc model')
-    parser.add_argument('--saved_model_name', type=str, default='v4',
+    parser.add_argument('--saved_model_name', type=str, default='v4_cov',
                         help='The name of saved model')
 
     """
     Training Argument
     """
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--learning_rate', type=int, default=0.005)
-    parser.add_argument('--epochs', type=int, default=100)  # 1000
+    parser.add_argument('--epochs', type=int, default=50)  # 1000
 
     parser.add_argument('--clip', type=float, default=-1,
                         help='gradient clip, -1 means no clip (default: 0.35)')
@@ -370,3 +366,4 @@ if __name__ == '__main__':
 
     debugger = Debugger(args)
     debugger.train()
+
